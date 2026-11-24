@@ -40,6 +40,10 @@ float widescreen_factor(void) { return load_wide(); }
 void widescreen_set_shape(float f) { atomic_store_explicit(&g_shape, f, memory_order_relaxed); }
 
 static bool hor_minus_env(void) { return ENV("LARECOMP_NARROW_HOR_MINUS"); }
+// Narrow Vert+ also writes the widened fovy (p[2]) so whatever rebuilds view rays from the angle (the shadow mask:
+// a black shadow away from Link that slid with the camera's pitch on 4:3, 2026-11-22) agrees with the matrix.
+// LARECOMP_NARROW_KEEP_FOVY=1: the old behaviour (fovy left at the game's value).
+static bool keep_fovy_env(void) { return ENV("LARECOMP_NARROW_KEEP_FOVY"); }
 static bool shape_vert_plus(float shape) {
     return isfinite(shape) && shape >= NARROW_MIN && shape < 0.999f && !hor_minus_env();
 }
@@ -105,7 +109,11 @@ enum { VERT_SLOTS = 256 };
 typedef struct {
     uint64_t proj, last_use;
     float near_z, far_z, orig_fovy, scaled_sin, scaled_cos, scaled_tan, scaled_aspect;
+    float scaled_fovy;  // (what p[2] was set to; 0 = left untouched: LARECOMP_NARROW_KEEP_FOVY)
 } VertProj;
+static bool fovy_is_scaled(const VertProj *e, float fovy) {
+    return e->scaled_fovy > 0.0f && fabsf(fovy - e->scaled_fovy) <= 1e-4f;
+}
 static pthread_mutex_t vert_mu = PTHREAD_MUTEX_INITIALIZER;
 static VertProj seen_vert[VERT_SLOTS];
 static uint64_t vert_tick;
@@ -152,6 +160,7 @@ void rt_persp_update(uint64_t proj) {
             if (seen_vert[i].proj == proj) {
                 bool trig_match = trig_scaled_match(&seen_vert[i], p);
                 bool nf_match = seen_vert[i].near_z == p[0] && seen_vert[i].far_z == p[1];
+                if (fovy_is_scaled(&seen_vert[i], p[2])) p[2] = seen_vert[i].orig_fovy;  // (put the game's angle back)
                 if (trig_match) {
                     float orig = (isfinite(p[2]) && p[2] > 0.01f && p[2] < 3.0f) ? p[2] : seen_vert[i].orig_fovy;
                     float half = orig * 0.5f;
@@ -196,13 +205,18 @@ void rt_persp_update(uint64_t proj) {
             if (seen_vert[i].proj == proj) { idx = i; break; }
         }
         float orig_fovy = p[2];
+        // p[2] still holds the angle written last time (the game resets only the aspect before a rebuild): scale from
+        // the game's own angle, not from ours again.
+        bool fovy_ours = idx >= 0 && fovy_is_scaled(&seen_vert[idx], p[2]);
+        if (fovy_ours) orig_fovy = seen_vert[idx].orig_fovy;
         bool apply = false;
         if (is169) {
             apply = true;
         } else if (idx >= 0) {
             if (fabsf(p[6] - want_aspect) < 0.002f) {
                 bool same_nf = seen_vert[idx].near_z == p[0] && seen_vert[idx].far_z == p[1];
-                bool trig_ok = trig_scaled_match(&seen_vert[idx], p) && fabsf(p[2] - seen_vert[idx].orig_fovy) <= 1e-4f;
+                bool trig_ok = trig_scaled_match(&seen_vert[idx], p) &&
+                               (fovy_ours || fabsf(p[2] - seen_vert[idx].orig_fovy) <= 1e-4f);
                 if (same_nf && !trig_ok) {
                     apply = true;
                 } else if (trig_ok) {
@@ -238,7 +252,10 @@ void rt_persp_update(uint64_t proj) {
         float cos_new = cosf(half_new);
         float fovy_new = 2.0f * half_new;
         float nz = p[0], fz = p[1];
-        // Leave stored fovy/mAngle (p[2]) untouched so game zoom/paraglider/cutscene blends reading fovy cannot creep.
+        // fovy/mAngle (p[2]): the widened angle too (see keep_fovy_env); fovy_is_scaled above recognises it on the next
+        // rebuild so it is never scaled twice. LARECOMP_NARROW_KEEP_FOVY=1 leaves it as the game wrote it.
+        float scaled_fovy = keep_fovy_env() ? 0.0f : fovy_new;
+        if (scaled_fovy > 0.0f) p[2] = scaled_fovy;
         p[3] = sin_new;
         p[4] = cos_new;
         p[5] = tan_new;
@@ -254,13 +271,14 @@ void rt_persp_update(uint64_t proj) {
             if (free_idx >= 0) { idx = free_idx; vert_count++; }
             else idx = lru_idx;
         }
-        seen_vert[idx] = (VertProj){proj, ++vert_tick, nz, fz, orig_fovy, sin_new, cos_new, tan_new, want_aspect};
+        seen_vert[idx] = (VertProj){proj, ++vert_tick, nz, fz, orig_fovy, sin_new, cos_new, tan_new, want_aspect, scaled_fovy};
         atomic_store_explicit(&vert_used, true, memory_order_release);
         bool do_log = ENV("LARECOMP_LOG_ASPECT") && log_vert_n < 20 && (++log_vert_n, true);
         pthread_mutex_unlock(&vert_mu);
         if (do_log)
-            LOG("[widescreen] projection %llx: aspect %.4f fovy %.1f -> %.1f deg (mAngle preserved)\n",
-                (unsigned long long)proj, want_aspect, orig_fovy * 57.29578f, fovy_new * 57.29578f);
+            LOG("[widescreen] projection %llx: aspect %.4f fovy %.1f -> %.1f deg (mAngle %s)\n",
+                (unsigned long long)proj, want_aspect, orig_fovy * 57.29578f, fovy_new * 57.29578f,
+                scaled_fovy > 0.0f ? "widened" : "preserved");
         return;
     }
     if (!is_16_9(p[6])) return;
